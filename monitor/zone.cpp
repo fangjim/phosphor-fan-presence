@@ -38,10 +38,6 @@ Zone::Zone(const ZoneDefinition& zoneConfig,
         if (!_loaded)
         {
             init(zoneConfig, fanDefs);
-            for (const auto& fan : _fans)
-            {
-                fan->init();
-            }
         }
     }
 }
@@ -399,10 +395,6 @@ void Zone::inventoryOnlineCb(sdbusplus::message_t& msg)
     if (!_loaded && !newName.empty())
     {
         init(_zoneConfig, _fanDefs);
-        for (const auto& fan : _fans)
-        {
-            fan->init();
-        }
     }
 
     // cancel any further notifications about the service state
@@ -537,6 +529,17 @@ void Zone::setFans(const ZoneDefinition& zoneConfig,
         _fans.emplace_back(std::make_unique<Fan>(
             phosphor::fan::monitor::Mode::monitor, _bus, _event, _trust,
             getFullDefFromType(*fanTypeConfig, fan), *this));
+
+        try
+        {
+            // init recently added fan
+            (_fans.back())->init();
+        }
+        catch (const phosphor::fan::util::DBusError& e)
+        {
+            lg2::error("Fan {FAN_NAME} init failed: {ERROR}", "FAN_NAME",
+                       (_fans.back())->getName(), "ERROR", e);
+        }
 
         updateFanHealth(*(_fans.back()));
     }
