@@ -16,6 +16,7 @@
 #pragma once
 
 #include "action.hpp"
+#include "chassis_manager.hpp"
 #include "event.hpp"
 #include "group.hpp"
 #include "json_config.hpp"
@@ -35,9 +36,11 @@
 
 #include <chrono>
 #include <format>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -493,6 +496,114 @@ class Manager
     void load();
 
     /**
+     * @brief Reacts to a chassis ready-state change (Present or Available
+     * property toggled) by either binding or removing its fans.
+     *
+     * Called by ChassisManager whenever a chassis's present/available state
+     * changes in either direction:
+     *
+     *  - Chassis goes unavailable (present=false or available=false):
+     *    Removes all fans for @p chassisPath from their zones so they no
+     *    longer receive stale D-Bus target calls.
+     *
+     *  - Chassis becomes ready (present=true, available=true):
+     *    Constructs fans from JSON, binds those whose sensor service is on
+     *    D-Bus, and installs InterfacesAdded watches for any that are not yet
+     *    present.  If host power is already on, the zone's current target is
+     *    immediately pushed to the newly bound fans.
+     *
+     * @param[in] chassisPath - Full D-Bus inventory path of the chassis
+     *                          whose ready-state changed
+     */
+    void handleChassisStatusChange(std::string chassisPath);
+
+    /**
+     * @brief Register chassis paths with the already-constructed
+     * ChassisManager.
+     *
+     * Iterates the already-parsed @p fans to collect unique chassis paths and
+     * their availability flags, builds _chassisPathToZones, and calls
+     * registerChassis() for each path.  Must be called after _chassisMgr has
+     * been constructed and after getConfig<Fan>() (parse-only), and before
+     * Fan::initSensors() is called on any fan.
+     *
+     * @param[in] fans - The already-parsed fan config map from getConfig<Fan>()
+     */
+    void initChassisManager(
+        const std::map<configKey, std::unique_ptr<Fan>>& fans);
+
+    /**
+     * @brief Called when a previously-absent fan sensor's target interface
+     * appears on D-Bus.
+     *
+     * Binds the specific fan to its zone, installs a loss watch, and clears
+     * the now-satisfied hotplug watch.
+     *
+     * Parameters are taken by value on purpose.  These handlers are invoked
+     * from inside an sdbusplus::match callback and go on to erase that very
+     * match; a const-ref parameter would alias the match lambda's own
+     * captures and dangle the moment the match is destroyed.
+     *
+     * @param[in] chassisPath - Chassis inventory path owning this fan
+     * @param[in] sensorPath  - The D-Bus sensor path that appeared
+     * @param[in] service     - Bus name that owns the sensor, taken from the
+     *            InterfacesAdded sender.  Used to bind without an
+     *            ObjectMapper lookup that would race the mapper.
+     */
+    void handleFanSensorAppeared(std::string chassisPath,
+                                 std::string sensorPath, std::string service);
+
+    /**
+     * @brief Called when a bound fan sensor disappears from D-Bus mid-run.
+     *
+     * Removes the fan from its zone, installs an InterfacesAdded recovery
+     * watch, and clears the stale loss watch.
+     *
+     * @param[in] chassisPath     - Chassis inventory path owning this fan
+     * @param[in] sensorPath      - The D-Bus sensor path that disappeared
+     * @param[in] targetInterface - The interface that was removed
+     */
+    void handleFanSensorLost(std::string chassisPath, std::string sensorPath,
+                             std::string targetInterface);
+
+    /**
+     * @brief Run @p work on the next event-loop iteration.
+     *
+     * Erasing an sdbusplus::match from inside that match's own callback
+     * destroys the std::function currently executing.  Anything that removes
+     * a watch in response to the signal that watch delivered has to go
+     * through here so the erase happens after the dispatch stack unwinds.
+     *
+     * @param[in] work - Callable to run once, then discard
+     */
+    void deferWork(std::function<void()> work);
+
+    /**
+     * @brief Push the current target to zones that just gained fans.
+     *
+     * Does nothing while power is off.  When a zone has never had a target
+     * established - it held no fans at load time and no power-on transition
+     * has happened since - the configured power-on target is used instead of
+     * the zone's zero target, which would otherwise stop the fans that just
+     * arrived.
+     *
+     * @param[in] zones - Zones that received at least one newly bound fan
+     */
+    void applyZoneTargets(const std::set<Zone*>& zones);
+
+    /**
+     * @brief Watch a newly bound fan's sensors for going away.
+     *
+     * Two subscriptions cover that one outcome: InterfacesRemoved catches a
+     * running service dropping the object, and NameOwnerChanged catches the
+     * service exiting outright, which emits no InterfacesRemoved at all.
+     *
+     * @param[in] chassisPath - Chassis inventory path owning this fan
+     * @param[in] fan         - The fan that was just bound
+     */
+    void watchBoundFanSensors(const std::string& chassisPath, const Fan& fan);
+
+    /**
      * @brief Sets a value in the parameter map.
      *
      * If it's a std::nullopt, it will be deleted instead.
@@ -624,11 +735,36 @@ class Manager
     /* List of timers and their data to be processed when expired */
     std::vector<std::pair<std::unique_ptr<TimerData>, Timer>> _timers;
 
+    /**
+     * @brief One-shot deferred callbacks posted to the event loop.
+     *
+     * Used when a watch re-install must be deferred until the current D-Bus
+     * dispatch stack fully unwinds (e.g. clearing a sdbusplus::match from
+     * within its own callback would be a use-after-free).  Each Defer source
+     * removes itself from this vector when it fires.
+     */
+    std::vector<std::unique_ptr<sdeventplus::source::Defer>> _deferredWork;
+
+    /** @brief Nesting depth of deferred-work callbacks currently running. */
+    unsigned _deferDepth{0};
+
     /* Map of signal match strings to a list of signal handler data */
     std::unordered_map<std::string, std::vector<SignalData>> _signals;
 
     /* List of zones configured */
     std::map<configKey, std::unique_ptr<Zone>> _zones;
+
+    /** Owns the ChassisManager for this Manager instance */
+    std::unique_ptr<ChassisManager> _chassisMgr;
+
+    /**
+     * @brief Maps each chassis inventory path to the zone names it contains.
+     *
+     * Built during load() by scanning fans.json.  Used by
+     * handleChassisStatusChange() to find which zones to rebuild when a
+     * specific chassis becomes ready.
+     */
+    std::map<std::string, std::set<std::string>> _chassisPathToZones;
 
     /* List of events configured */
     std::map<configKey, std::unique_ptr<Event>> _events;
